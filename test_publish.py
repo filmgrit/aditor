@@ -1,4 +1,8 @@
 import unittest
+from unittest.mock import patch
+import json, os, urllib.error
+from tempfile import TemporaryDirectory
+from pathlib import Path
 from datetime import datetime, timedelta
 import publish as p
 
@@ -18,4 +22,26 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(p.select(self.rows,self.proposals[:2],[],self.now)),2)
     def test_evidence_score(self):
         rows=self.rows+[dict(self.rows[0],source='Source B',url='https://example.org/one')]; proposals=[dict(self.proposals[0],refs=[0,8])]; c=p.select(rows,proposals,[],self.now)[0];self.assertEqual(c['scores']['화제성'],20);self.assertEqual(len(c['evidence']),2)
+    def test_gemini_request(self):
+        expected={'campaigns':self.proposals[:1]}
+        response={'candidates':[{'finishReason':'STOP','content':{'parts':[{'thought':True,'text':'internal'},{'text':json.dumps(expected)}]}}]}
+        with patch.dict(os.environ,{'GEMINI_API_KEY':'fake-key'}), patch.object(p,'get',return_value=json.dumps(response).encode()) as request:
+            self.assertEqual(p.curate(self.rows,[]),expected['campaigns'])
+            url,body,headers=request.call_args.args
+            self.assertEqual(url,'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent')
+            self.assertEqual(headers['x-goog-api-key'],'fake-key')
+            self.assertNotIn('fake-key',url+body.decode())
+            self.assertEqual(json.loads(body)['generationConfig']['responseJsonSchema'],p.SCHEMA)
+    def test_quota_preserves_archive(self):
+        with TemporaryDirectory() as d:
+            out=Path(d)/'campaigns.json'; initial='{"schema":1,"campaigns":[],"editions":{}}';out.write_text(initial)
+            err=urllib.error.HTTPError('https://example.com',429,'limit',None,None)
+            with patch.dict(os.environ,{'GEMINI_API_KEY':'fake-key'}),patch.object(p,'OUT',out),patch.object(p,'collect',return_value=(self.rows,[])),patch.object(p,'get',side_effect=err) as request:
+                with self.assertRaisesRegex(RuntimeError,'429'): p.publish(self.now)
+                self.assertEqual(request.call_count,1)
+                self.assertEqual(out.read_text(),initial)
+    def test_invalid_response(self):
+        for response in [{'candidates':[]},{'candidates':[{'finishReason':'MAX_TOKENS'}]},{'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':'{"campaigns":[{}]}'}]}}]}]:
+            with patch.dict(os.environ,{'GEMINI_API_KEY':'fake-key'}),patch.object(p,'get',return_value=json.dumps(response).encode()):
+                with self.assertRaises((RuntimeError,ValueError)): p.curate(self.rows,[])
 if __name__=='__main__': unittest.main()
